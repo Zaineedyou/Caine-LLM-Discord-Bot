@@ -1,17 +1,25 @@
 const { Client, GatewayIntentBits, Events, ActivityType, Partials, PermissionsBitField, REST, Routes, SlashCommandBuilder } = require("discord.js");
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require("@discordjs/voice");
+const { spawn } = require("child_process");
+const fs = require("fs");
+const path = require("path");
 const Groq = require("groq-sdk");
 const fetch = require("node-fetch");
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 const BOT_PREFIX = process.env.BOT_PREFIX || "Caine";
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "Kamu adalah AI asisten perempuan bernama Caine yang nyantai dan gaul. Jawab pake bahasa Indonesia slang yang natural, kayak ngobrol sama pacar dan memanggil user dengan panggilan mesra seperti sayang, baby,dll. Tetep informatif dan tepat tapi ga kaku. Jangan pake bahasa formal atau kaku.";
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || "1503911709897785464";
 const CLIENT_ID = "1503728763416875118";
+const MUSIC_DIR = process.env.MUSIC_DIR || "/storage/emulated/0/Music";
 
 const groq = new Groq({ apiKey: GROQ_API_KEY });
+
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildModeration],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildModeration, GatewayIntentBits.GuildVoiceStates],
   partials: [Partials.Channel, Partials.Message],
 });
 
@@ -19,8 +27,72 @@ const conversationHistory = new Map();
 const warnData = new Map();
 const bannedWords = new Set();
 const disabledChannels = new Set();
+const players = new Map();
 const MAX_HISTORY = 30;
 const startTime = Date.now();
+
+// ============================================================
+// SPOTIFY TOKEN
+// ============================================================
+let spotifyToken = null;
+let spotifyTokenExpiry = 0;
+
+async function getSpotifyToken() {
+  if (spotifyToken && Date.now() < spotifyTokenExpiry) return spotifyToken;
+  const res = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Authorization": "Basic " + Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64"),
+    },
+    body: "grant_type=client_credentials",
+  });
+  const data = await res.json();
+  spotifyToken = data.access_token;
+  spotifyTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  return spotifyToken;
+}
+
+async function getSpotifyTrack(trackId) {
+  const token = await getSpotifyToken();
+  const res = await fetch(`https://api.spotify.com/v1/tracks/${trackId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await res.json();
+  return `${data.name} ${data.artists[0].name}`;
+}
+
+async function getSpotifyPlaylist(playlistId) {
+  const token = await getSpotifyToken();
+  let tracks = [];
+  let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=50`;
+  while (url) {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    const data = await res.json();
+    for (const item of data.items) {
+      if (item.track) tracks.push(`${item.track.name} ${item.track.artists[0].name}`);
+    }
+    url = data.next;
+  }
+  return tracks;
+}
+
+async function getSpotifyAlbum(albumId) {
+  const token = await getSpotifyToken();
+  const res = await fetch(`https://api.spotify.com/v1/albums/${albumId}/tracks?limit=50`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await res.json();
+  const albumRes = await fetch(`https://api.spotify.com/v1/albums/${albumId}`, { headers: { Authorization: `Bearer ${token}` } });
+  const albumData = await albumRes.json();
+  return data.items.map(t => `${t.name} ${albumData.artists[0].name}`);
+}
+
+function parseSpotifyUrl(url) {
+  const match = url.match(/spotify\.com\/(track|playlist|album)\/([a-zA-Z0-9]+)/);
+  if (!match) return null;
+  return { type: match[1], id: match[2] };
+}
 
 // ============================================================
 // HISTORY
@@ -48,7 +120,6 @@ function getUptime() {
 async function sendLog(embed) {
   try { const ch = await client.channels.fetch(LOG_CHANNEL_ID); if (ch) await ch.send({ embeds: [embed] }); } catch (e) { console.error("Log error:", e); }
 }
-
 async function logChat(message, userText, reply) {
   const { EmbedBuilder } = require("discord.js");
   await sendLog(new EmbedBuilder().setColor(0x5865f2).setTitle("💬 Chat Log").addFields(
@@ -58,7 +129,6 @@ async function logChat(message, userText, reply) {
     { name: "Jawaban", value: reply?.slice(0, 1000) || "(kosong)" }
   ).setTimestamp());
 }
-
 async function logMod(action, moderator, target, reason) {
   const { EmbedBuilder } = require("discord.js");
   await sendLog(new EmbedBuilder().setColor(0xff0000).setTitle(`🔨 Moderasi — ${action}`).addFields(
@@ -67,7 +137,6 @@ async function logMod(action, moderator, target, reason) {
     { name: "Alasan", value: reason || "Tidak ada alasan" }
   ).setTimestamp());
 }
-
 async function logReport(reporter, target, reason, message) {
   const { EmbedBuilder } = require("discord.js");
   const logChannel = await client.channels.fetch(LOG_CHANNEL_ID);
@@ -80,7 +149,6 @@ async function logReport(reporter, target, reason, message) {
   const admins = message.guild.members.cache.filter(m => m.permissions.has(PermissionsBitField.Flags.Administrator) && !m.user.bot);
   await logChannel.send({ content: `📢 **Report baru!** ${admins.map(a => `<@${a.id}>`).join(" ")}`, embeds: [embed] });
 }
-
 async function logAutomod(message, word) {
   const { EmbedBuilder } = require("discord.js");
   await sendLog(new EmbedBuilder().setColor(0xffaa00).setTitle("🤖 Automod — Pesan Dihapus").addFields(
@@ -92,20 +160,15 @@ async function logAutomod(message, word) {
 }
 
 // ============================================================
-// AI - GPT OSS 120B dengan built-in browser search
+// AI
 // ============================================================
 async function askGroq(key, userMessage, displayName = "User") {
   const history = getHistory(key);
-
   const messages = [
-    {
-      role: "system",
-      content: SYSTEM_PROMPT + `\n\nPENTING: Percakapan ini terjadi di Discord. Setiap pesan user diawali dengan nama mereka dalam format [NamaUser]. Ingat dan bedakan setiap user berdasarkan nama mereka. Jangan campur-campur siapa yang ngomong apa.`
-    },
+    { role: "system", content: SYSTEM_PROMPT + `\n\nPENTING: Percakapan ini terjadi di Discord. Setiap pesan user diawali dengan nama mereka dalam format [NamaUser]. Ingat dan bedakan setiap user berdasarkan nama mereka.` },
     ...history,
     { role: "user", content: `[${displayName}]: ${userMessage}` },
   ];
-
   const res = await Promise.race([
     groq.chat.completions.create({
       model: "openai/gpt-oss-120b",
@@ -117,7 +180,6 @@ async function askGroq(key, userMessage, displayName = "User") {
     }),
     new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 20000))
   ]);
-
   const reply = res.choices[0].message.content;
   addToHistory(key, "user", `[${displayName}]: ${userMessage}`);
   addToHistory(key, "assistant", reply);
@@ -167,6 +229,163 @@ function botHasPerm(message, perm) { return message.guild?.members.me.permission
 function getWarnings(userId, guildId) { const k = `${guildId}-${userId}`; if (!warnData.has(k)) warnData.set(k, []); return warnData.get(k); }
 function addWarning(userId, guildId, reason) { const w = getWarnings(userId, guildId); w.push({ reason, time: new Date().toISOString() }); return w.length; }
 function clearWarnings(userId, guildId) { warnData.delete(`${guildId}-${userId}`); }
+
+// ============================================================
+// MUSIC
+// ============================================================
+const queues = new Map();
+
+function findLocalFile(query) {
+  if (!fs.existsSync(MUSIC_DIR)) return null;
+  const files = fs.readdirSync(MUSIC_DIR).filter(f => /\.(flac|mp3|m4a|wav|ogg|opus)$/i.test(f));
+  const q = query.toLowerCase();
+  return files.find(f => f.toLowerCase().includes(q)) || null;
+}
+
+function listLocalFiles() {
+  if (!fs.existsSync(MUSIC_DIR)) return [];
+  return fs.readdirSync(MUSIC_DIR).filter(f => /\.(flac|mp3|m4a|wav|ogg|opus)$/i.test(f));
+}
+
+async function playNext(guildId, voiceChannel, message) {
+  const queue = queues.get(guildId);
+  if (!queue || queue.length === 0) {
+    const current = players.get(guildId);
+    if (current) { current.connection.destroy(); players.delete(guildId); }
+    queues.delete(guildId);
+    return;
+  }
+
+  const query = queue.shift();
+  const connection = players.get(guildId)?.connection || joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId,
+    adapterCreator: message.guild.voiceAdapterCreator,
+  });
+
+  const localFile = findLocalFile(query);
+  let resource;
+  if (localFile) {
+    resource = createAudioResource(path.join(MUSIC_DIR, localFile));
+  } else {
+    const ytdlp = spawn("yt-dlp", ["-f", "bestaudio", "-o", "-", `ytsearch1:${query}`]);
+    resource = createAudioResource(ytdlp.stdout);
+  }
+
+  const player = createAudioPlayer();
+  player.play(resource);
+  connection.subscribe(player);
+  players.set(guildId, { player, connection });
+  player.on(AudioPlayerStatus.Idle, () => playNext(guildId, voiceChannel, message));
+  player.on("error", () => playNext(guildId, voiceChannel, message));
+
+  if (message) message.channel.send(`▶️ Playing: **${query}**`).catch(() => {});
+}
+
+async function handleMusic(message, userText) {
+  const args = userText.trim().split(/\s+/);
+  const cmd = args[0]?.toLowerCase();
+  const musicCmds = ["play", "playfile", "stop", "list", "queue", "skip"];
+  if (!musicCmds.includes(cmd)) return false;
+
+  const guildId = message.guild.id;
+
+  if (cmd === "list") {
+    const files = listLocalFiles();
+    if (files.length === 0) return message.reply(`❌ Folder musik kosong: \`${MUSIC_DIR}\``), true;
+    const list = files.slice(0, 30).map((f, i) => `${i + 1}. ${f}`).join("\n");
+    const chunks = splitMessage(`🎵 **Musik lokal (${files.length} file):**\n\`\`\`\n${list}\n\`\`\``);
+    for (const chunk of chunks) await message.reply(chunk);
+    return true;
+  }
+
+  if (cmd === "queue") {
+    const queue = queues.get(guildId) || [];
+    if (queue.length === 0) return message.reply("📋 Queue kosong sayang!"), true;
+    const list = queue.slice(0, 20).map((q, i) => `${i + 1}. ${q}`).join("\n");
+    return message.reply(`📋 **Queue (${queue.length} lagu):**\n${list}`), true;
+  }
+
+  if (cmd === "skip") {
+    const current = players.get(guildId);
+    if (!current) return message.reply("❌ Ga ada yang lagi diplay sayang!"), true;
+    current.player.stop();
+    return message.reply("⏭️ Skipped!"), true;
+  }
+
+  if (cmd === "stop") {
+    const current = players.get(guildId);
+    if (!current) return message.reply("❌ Ga ada yang lagi diplay sayang!"), true;
+    queues.delete(guildId);
+    current.player.stop();
+    current.connection.destroy();
+    players.delete(guildId);
+    return message.reply("⏹️ Musik dihentiin sayang!"), true;
+  }
+
+  const voiceChannel = message.member?.voice?.channel;
+  if (!voiceChannel) return message.reply("❌ Lo harus di voice channel dulu sayang!"), true;
+
+  if (cmd === "play") {
+    const input = args.slice(1).join(" ");
+    if (!input) return message.reply("❌ Masukin nama lagu atau link Spotify sayang!"), true;
+
+    const spotifyInfo = parseSpotifyUrl(input);
+    if (spotifyInfo) {
+      await message.reply("🔍 Fetching dari Spotify...");
+      try {
+        let trackList = [];
+        if (spotifyInfo.type === "track") {
+          const q = await getSpotifyTrack(spotifyInfo.id);
+          trackList = [q];
+        } else if (spotifyInfo.type === "playlist") {
+          trackList = await getSpotifyPlaylist(spotifyInfo.id);
+        } else if (spotifyInfo.type === "album") {
+          trackList = await getSpotifyAlbum(spotifyInfo.id);
+        }
+
+        if (!queues.has(guildId)) queues.set(guildId, []);
+        queues.get(guildId).push(...trackList);
+
+        if (!players.has(guildId)) {
+          await playNext(guildId, voiceChannel, message);
+        }
+
+        return message.reply(`✅ Ditambahin **${trackList.length} lagu** ke queue dari Spotify!`), true;
+      } catch (e) {
+        return message.reply("❌ Gagal fetch dari Spotify sayang."), true;
+      }
+    }
+
+    // Non-Spotify
+    if (!queues.has(guildId)) queues.set(guildId, []);
+    queues.get(guildId).push(input);
+    if (!players.has(guildId)) {
+      await playNext(guildId, voiceChannel, message);
+    } else {
+      message.reply(`➕ **${input}** ditambahin ke queue!`);
+    }
+    return true;
+  }
+
+  if (cmd === "playfile") {
+    const query = args.slice(1).join(" ");
+    if (!query) return message.reply("❌ Masukin nama file sayang!"), true;
+    const localFile = findLocalFile(query);
+    if (!localFile) return message.reply(`❌ File **${query}** ga ketemu. Coba \`Caine list\`.`), true;
+
+    if (!queues.has(guildId)) queues.set(guildId, []);
+    queues.get(guildId).push(query);
+    if (!players.has(guildId)) {
+      await playNext(guildId, voiceChannel, message);
+    } else {
+      message.reply(`➕ **${localFile}** ditambahin ke queue!`);
+    }
+    return true;
+  }
+
+  return false;
+}
 
 // ============================================================
 // MODERATION
@@ -239,8 +458,7 @@ async function handleModeration(message, userText) {
   if (cmd === "clearwarn") {
     if (!userHasPerm(message, PermissionsBitField.Flags.ModerateMembers)) return message.reply("❌ Kamu ga punya permission sayang."), true;
     if (!mention) return message.reply("❌ Mention siapa yang mau dihapus warningnya."), true;
-    clearWarnings(mention.id, message.guild.id);
-    return message.reply(`✅ Warning **${mention.user.tag}** udah dihapus.`), true;
+    clearWarnings(mention.id, message.guild.id); return message.reply(`✅ Warning **${mention.user.tag}** udah dihapus.`), true;
   }
   if (cmd === "clear") {
     if (!userHasPerm(message, PermissionsBitField.Flags.ManageMessages)) return message.reply("❌ Kamu ga punya permission sayang."), true;
@@ -324,7 +542,6 @@ async function summarizeChannel(message, amount = 30) {
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Bot online: ${c.user.tag}`);
   c.user.setPresence({ activities: [{ name: "custom", type: ActivityType.Custom, state: "Property Of Caineedyou | Developed By Zaineedyou" }] });
-
   try {
     const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
     await rest.put(Routes.applicationCommands(CLIENT_ID), {
@@ -348,6 +565,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { name: "🤖 Text Model", value: "GPT OSS 120B (Groq)", inline: true },
         { name: "👁️ Vision Model", value: "Llama 4 Scout 17B (Groq)", inline: true },
         { name: "🔍 Web Search", value: "Built-in (GPT OSS)", inline: true },
+        { name: "🎵 Music", value: "Local FLAC + YouTube + Spotify", inline: true },
         { name: "⏱️ Uptime", value: getUptime(), inline: true },
         { name: "📡 Status", value: "🟢 Online", inline: true },
         { name: "🏠 Server", value: interaction.guild?.name || "User Install", inline: true },
@@ -378,6 +596,7 @@ client.on(Events.MessageCreate, async (message) => {
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (disabledChannels.has(message.channelId)) return;
+
   const content = message.content.trim();
   const isMentioned = message.mentions.has(client.user);
   const hasPrefix = content.toLowerCase().includes(BOT_PREFIX.toLowerCase());
@@ -394,6 +613,7 @@ client.on(Events.MessageCreate, async (message) => {
 
   if (userText.toLowerCase() === "reset" || userText.toLowerCase() === "clear") { clearHistory(historyKey); return message.reply("🧹 Memory kita udah di-reset sayang!"); }
   if (userText.toLowerCase().startsWith("summarize")) { return summarizeChannel(message, parseInt(userText.split(" ")[1]) || 30); }
+
   if (userText.toLowerCase() === "help") {
     return message.reply(
       "**Hai sayang! Ini cara pakai aku:**\n" +
@@ -403,10 +623,20 @@ client.on(Events.MessageCreate, async (message) => {
       "`Caine report @user alasan` — laporin user\n" +
       "`Caine reset` — hapus memory\n" +
       "`/info` — lihat info bot\n\n" +
+      "**Musik:**\n" +
+      "`Caine play <judul/link Spotify>` — play lagu atau link Spotify\n" +
+      "`Caine playfile <nama>` — play file lokal\n" +
+      "`Caine list` — lihat file musik lokal\n" +
+      "`Caine queue` — lihat antrian\n" +
+      "`Caine skip` — skip lagu\n" +
+      "`Caine stop` — stop musik\n\n" +
       "**Moderasi:** kick, ban, unban, timeout, untimeout, warn, warnings, clearwarn, clear, lock, unlock, slowmode, nick, role add/remove\n\n" +
       "**Admin:** addword, removeword, words, enable, disable"
     );
   }
+
+  const isMusic = await handleMusic(message, userText);
+  if (isMusic) return;
 
   const isMod = await handleModeration(message, userText);
   if (isMod) return;
