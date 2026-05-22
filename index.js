@@ -1,21 +1,19 @@
 const { Client, GatewayIntentBits, Events, ActivityType, Partials, PermissionsBitField, REST, Routes, SlashCommandBuilder } = require("discord.js");
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require("@discordjs/voice");
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, StreamType } = require("@discordjs/voice");
 const { spawn } = require("child_process");
-const fs = require("fs");
-const path = require("path");
 const Groq = require("groq-sdk");
 const fetch = require("node-fetch");
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 const BOT_PREFIX = process.env.BOT_PREFIX || "Caine";
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "Kamu adalah AI asisten perempuan bernama Caine yang nyantai dan gaul. Jawab pake bahasa Indonesia slang yang natural, kayak ngobrol sama pacar dan memanggil user dengan panggilan mesra seperti sayang, baby,dll. Tetep informatif dan tepat tapi ga kaku. Jangan pake bahasa formal atau kaku.";
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || "1503911709897785464";
 const CLIENT_ID = "1503728763416875118";
-const MUSIC_DIR = process.env.MUSIC_DIR || "/storage/emulated/0/Music";
 
 const groq = new Groq({ apiKey: GROQ_API_KEY });
-
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildModeration, GatewayIntentBits.GuildVoiceStates],
   partials: [Partials.Channel, Partials.Message],
@@ -26,8 +24,180 @@ const warnData = new Map();
 const bannedWords = new Set();
 const disabledChannels = new Set();
 const players = new Map();
+const queues = new Map();
 const MAX_HISTORY = 30;
 const startTime = Date.now();
+
+// ============================================================
+// SPOTIFY TOKEN
+// ============================================================
+let spotifyToken = null;
+let spotifyTokenExpiry = 0;
+
+async function getSpotifyToken() {
+  if (spotifyToken && Date.now() < spotifyTokenExpiry) return spotifyToken;
+  const res = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Authorization": "Basic " + Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64"),
+    },
+    body: "grant_type=client_credentials",
+  });
+  const data = await res.json();
+  spotifyToken = data.access_token;
+  spotifyTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  return spotifyToken;
+}
+
+async function getSpotifyTrack(trackId) {
+  const token = await getSpotifyToken();
+  const res = await fetch(`https://api.spotify.com/v1/tracks/${trackId}`, { headers: { Authorization: `Bearer ${token}` } });
+  const data = await res.json();
+  return `${data.artists[0].name} ${data.name}`;
+}
+
+async function getSpotifyPlaylist(playlistId) {
+  const token = await getSpotifyToken();
+  let tracks = [], offset = 0;
+  while (true) {
+    const res = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=50&offset=${offset}`, { headers: { Authorization: `Bearer ${token}` } });
+    const data = await res.json();
+    const items = data.items?.filter(i => i.track) || [];
+    tracks.push(...items.map(i => `${i.track.artists[0].name} ${i.track.name}`));
+    if (!data.next) break;
+    offset += 50;
+  }
+  return tracks;
+}
+
+async function getSpotifyAlbum(albumId) {
+  const token = await getSpotifyToken();
+  const res = await fetch(`https://api.spotify.com/v1/albums/${albumId}/tracks?limit=50`, { headers: { Authorization: `Bearer ${token}` } });
+  const data = await res.json();
+  const albumRes = await fetch(`https://api.spotify.com/v1/albums/${albumId}`, { headers: { Authorization: `Bearer ${token}` } });
+  const albumData = await albumRes.json();
+  return data.items.map(t => `${albumData.artists[0].name} ${t.name}`);
+}
+
+function parseSpotifyUrl(url) {
+  const match = url.match(/spotify\.com\/(track|playlist|album)\/([a-zA-Z0-9]+)/);
+  if (!match) return null;
+  return { type: match[1], id: match[2] };
+}
+
+// ============================================================
+// MUSIC CORE
+// ============================================================
+function getQueue(guildId) { if (!queues.has(guildId)) queues.set(guildId, []); return queues.get(guildId); }
+
+async function playNext(guildId, message) {
+  const queue = getQueue(guildId);
+  if (queue.length === 0) {
+    const current = players.get(guildId);
+    if (current) { current.connection.destroy(); players.delete(guildId); }
+    return;
+  }
+
+  const query = queue.shift();
+  const current = players.get(guildId);
+  if (!current) return;
+
+  try {
+    const ytdlp = spawn("yt-dlp", ["-f", "bestaudio", "--no-playlist", "-o", "-", `ytsearch1:${query}`]);
+    ytdlp.stderr.on("data", d => console.error("yt-dlp:", d.toString()));
+    const resource = createAudioResource(ytdlp.stdout, { inputType: StreamType.Arbitrary });
+    current.player.play(resource);
+    if (message) message.channel.send(`▶️ Playing: **${query}**`).catch(() => {});
+  } catch (err) {
+    console.error("playNext error:", err);
+    playNext(guildId, message);
+  }
+}
+
+async function handleMusic(message, userText) {
+  const args = userText.trim().split(/\s+/);
+  const cmd = args[0]?.toLowerCase();
+  const musicCmds = ["play", "stop", "skip", "queue"];
+  if (!musicCmds.includes(cmd)) return false;
+
+  const guildId = message.guild.id;
+
+  if (cmd === "queue") {
+    const q = getQueue(guildId);
+    if (q.length === 0) return message.reply("📭 Queue kosong sayang!"), true;
+    return message.reply(`📋 **Queue (${q.length} lagu):**\n${q.slice(0, 20).map((t, i) => `${i+1}. ${t}`).join("\n")}`), true;
+  }
+
+  if (cmd === "stop") {
+    const current = players.get(guildId);
+    if (!current) return message.reply("❌ Ga ada yang lagi diplay sayang!"), true;
+    queues.set(guildId, []);
+    current.player.stop();
+    current.connection.destroy();
+    players.delete(guildId);
+    return message.reply("⏹️ Musik dihentiin sayang!"), true;
+  }
+
+  if (cmd === "skip") {
+    const current = players.get(guildId);
+    if (!current) return message.reply("❌ Ga ada yang lagi diplay sayang!"), true;
+    current.player.stop();
+    return message.reply("⏭️ Skipped!"), true;
+  }
+
+  if (cmd === "play") {
+    const input = args.slice(1).join(" ");
+    if (!input) return message.reply("❌ Masukin nama lagu atau link Spotify sayang!"), true;
+
+    const voiceChannel = message.member?.voice?.channel;
+    if (!voiceChannel) return message.reply("❌ Lo harus di voice channel dulu sayang!"), true;
+
+    let current = players.get(guildId);
+    if (!current) {
+      const connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId,
+        adapterCreator: message.guild.voiceAdapterCreator,
+        selfDeaf: false,
+      });
+      const player = createAudioPlayer();
+      connection.subscribe(player);
+      current = { player, connection };
+      players.set(guildId, current);
+      player.on("error", err => { console.error("Player error:", err); playNext(guildId, message); });
+      player.on(AudioPlayerStatus.Idle, () => playNext(guildId, message));
+    }
+
+    const spotifyInfo = parseSpotifyUrl(input);
+    if (spotifyInfo) {
+      if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) return message.reply("❌ Spotify API belum dikonfigurasi sayang!"), true;
+      try {
+        let tracks = [];
+        if (spotifyInfo.type === "track") tracks = [await getSpotifyTrack(spotifyInfo.id)];
+        else if (spotifyInfo.type === "playlist") tracks = await getSpotifyPlaylist(spotifyInfo.id);
+        else if (spotifyInfo.type === "album") tracks = await getSpotifyAlbum(spotifyInfo.id);
+        getQueue(guildId).push(...tracks);
+        await message.reply(`✅ **${tracks.length} lagu** dari Spotify ditambahkan ke queue!`);
+        if (current.player.state.status === AudioPlayerStatus.Idle) await playNext(guildId, message);
+      } catch (err) {
+        console.error("Spotify error:", err);
+        return message.reply("❌ Gagal fetch data Spotify sayang!"), true;
+      }
+      return true;
+    }
+
+    getQueue(guildId).push(input);
+    if (current.player.state.status === AudioPlayerStatus.Idle) {
+      await playNext(guildId, message);
+    } else {
+      await message.reply(`✅ **${input}** ditambahkan ke queue!`);
+    }
+    return true;
+  }
+
+  return false;
+}
 
 // ============================================================
 // HISTORY
@@ -37,15 +207,9 @@ function getHistory(key) { if (!conversationHistory.has(key)) conversationHistor
 function addToHistory(key, role, content) { const h = getHistory(key); h.push({ role, content }); if (h.length > MAX_HISTORY * 2) h.splice(0, 2); }
 function clearHistory(key) { conversationHistory.delete(key); }
 
-// ============================================================
-// UPTIME
-// ============================================================
 function getUptime() {
   const ms = Date.now() - startTime;
-  const s = Math.floor(ms / 1000);
-  const m = Math.floor(s / 60);
-  const h = Math.floor(m / 60);
-  const d = Math.floor(h / 24);
+  const s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
   return `${d}d ${h % 24}h ${m % 60}m ${s % 60}s`;
 }
 
@@ -104,7 +268,7 @@ async function logAutomod(message, word) {
 async function askGroq(key, userMessage, displayName = "User") {
   const history = getHistory(key);
   const messages = [
-    { role: "system", content: SYSTEM_PROMPT + `\n\nPENTING: Percakapan ini terjadi di Discord. Setiap pesan user diawali dengan nama mereka dalam format [NamaUser]. Ingat dan bedakan setiap user berdasarkan nama mereka.` },
+    { role: "system", content: SYSTEM_PROMPT + `\n\nPENTING: Percakapan ini terjadi di Discord. Setiap pesan user diawali dengan nama mereka dalam format [NamaUser].` },
     ...history,
     { role: "user", content: `[${displayName}]: ${userMessage}` },
   ];
@@ -130,17 +294,16 @@ async function askVision(key, userMessage, imageUrl, displayName = "User") {
   if (!imgRes.ok) throw new Error(`Gagal fetch gambar: ${imgRes.status}`);
   const base64Image = Buffer.from(await imgRes.arrayBuffer()).toString("base64");
   const mimeType = imgRes.headers.get("content-type")?.split(";")[0] || "image/png";
-  const prompt = userMessage || "Deskripsiin gambar ini secara detail.";
   const res = await groq.chat.completions.create({
     model: "meta-llama/llama-4-scout-17b-16e-instruct",
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: [{ type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } }, { type: "text", text: `[${displayName}]: ${prompt}` }] }
+      { role: "user", content: [{ type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } }, { type: "text", text: `[${displayName}]: ${userMessage || "Deskripsiin gambar ini."}` }] }
     ],
     max_tokens: 1024,
   });
   const reply = res.choices[0].message.content;
-  addToHistory(key, "user", `[${displayName}]: [kirim gambar] ${prompt}`);
+  addToHistory(key, "user", `[${displayName}]: [kirim gambar] ${userMessage}`);
   addToHistory(key, "assistant", reply);
   return reply;
 }
@@ -156,113 +319,11 @@ function splitMessage(text, maxLength = 1900) {
   return chunks;
 }
 
-// ============================================================
-// PERMISSION
-// ============================================================
 function userHasPerm(message, perm) { return message.member?.permissions.has(perm); }
 function botHasPerm(message, perm) { return message.guild?.members.me.permissions.has(perm); }
-
-// ============================================================
-// WARNING
-// ============================================================
 function getWarnings(userId, guildId) { const k = `${guildId}-${userId}`; if (!warnData.has(k)) warnData.set(k, []); return warnData.get(k); }
 function addWarning(userId, guildId, reason) { const w = getWarnings(userId, guildId); w.push({ reason, time: new Date().toISOString() }); return w.length; }
 function clearWarnings(userId, guildId) { warnData.delete(`${guildId}-${userId}`); }
-
-// ============================================================
-// MUSIC
-// ============================================================
-function findLocalFile(query) {
-  if (!fs.existsSync(MUSIC_DIR)) return null;
-  const files = fs.readdirSync(MUSIC_DIR).filter(f => /\.(flac|mp3|m4a|wav|ogg|opus)$/i.test(f));
-  const q = query.toLowerCase();
-  return files.find(f => f.toLowerCase().includes(q)) || null;
-}
-
-function listLocalFiles() {
-  if (!fs.existsSync(MUSIC_DIR)) return [];
-  return fs.readdirSync(MUSIC_DIR).filter(f => /\.(flac|mp3|m4a|wav|ogg|opus)$/i.test(f));
-}
-
-async function handleMusic(message, userText) {
-  const args = userText.trim().split(/\s+/);
-  const cmd = args[0]?.toLowerCase();
-  const musicCmds = ["play", "playfile", "stop", "list"];
-  if (!musicCmds.includes(cmd)) return false;
-
-  const guildId = message.guild.id;
-
-  if (cmd === "list") {
-    const files = listLocalFiles();
-    if (files.length === 0) return message.reply(`❌ Folder musik kosong atau ga bisa diakses: \`${MUSIC_DIR}\``), true;
-    const list = files.slice(0, 30).map((f, i) => `${i + 1}. ${f}`).join("\n");
-    const chunks = splitMessage(`🎵 **Musik lokal lo (${files.length} file):**\n\`\`\`\n${list}\n\`\`\``);
-    for (const chunk of chunks) await message.reply(chunk);
-    return true;
-  }
-
-  const voiceChannel = message.member?.voice?.channel;
-  if (!voiceChannel) return message.reply("❌ Kamu harus di voice channel dulu sayang!"), true;
-
-  if (cmd === "stop") {
-    const current = players.get(guildId);
-    if (!current) return message.reply("❌ Ga ada yang lagi diplay sayang!"), true;
-    current.player.stop();
-    current.connection.destroy();
-    players.delete(guildId);
-    return message.reply("⏹️ Musik dihentiin sayang!"), true;
-  }
-
-  if (cmd === "play") {
-    const query = args.slice(1).join(" ");
-    if (!query) return message.reply("❌ Masukin nama lagu sayang!"), true;
-
-    // Cek lokal dulu
-    const localFile = findLocalFile(query);
-    if (localFile) {
-      const filePath = path.join(MUSIC_DIR, localFile);
-      const connection = joinVoiceChannel({ channelId: voiceChannel.id, guildId, adapterCreator: message.guild.voiceAdapterCreator });
-      const resource = createAudioResource(filePath);
-      const player = createAudioPlayer();
-      player.play(resource);
-      connection.subscribe(player);
-      players.set(guildId, { player, connection });
-      player.on(AudioPlayerStatus.Idle, () => { connection.destroy(); players.delete(guildId); });
-      return message.reply(`▶️ Playing lokal: **${localFile}**`), true;
-    }
-
-    // Fallback ke YouTube
-    const connection = joinVoiceChannel({ channelId: voiceChannel.id, guildId, adapterCreator: message.guild.voiceAdapterCreator });
-    const ytdlp = spawn("yt-dlp", ["-f", "bestaudio", "-o", "-", `ytsearch1:${query}`]);
-    const resource = createAudioResource(ytdlp.stdout);
-    const player = createAudioPlayer();
-    player.play(resource);
-    connection.subscribe(player);
-    players.set(guildId, { player, connection });
-    player.on(AudioPlayerStatus.Idle, () => { connection.destroy(); players.delete(guildId); });
-    return message.reply(`▶️ Playing: **${query}**`), true;
-  }
-
-  if (cmd === "playfile") {
-    const query = args.slice(1).join(" ");
-    if (!query) return message.reply("❌ Masukin nama file sayang!"), true;
-
-    const localFile = findLocalFile(query);
-    if (!localFile) return message.reply(`❌ File **${query}** ga ketemu di folder musik sayang. Coba \`Caine list\` buat liat file yang ada.`), true;
-
-    const filePath = path.join(MUSIC_DIR, localFile);
-    const connection = joinVoiceChannel({ channelId: voiceChannel.id, guildId, adapterCreator: message.guild.voiceAdapterCreator });
-    const resource = createAudioResource(filePath);
-    const player = createAudioPlayer();
-    player.play(resource);
-    connection.subscribe(player);
-    players.set(guildId, { player, connection });
-    player.on(AudioPlayerStatus.Idle, () => { connection.destroy(); players.delete(guildId); });
-    return message.reply(`▶️ Playing lokal: **${localFile}**`), true;
-  }
-
-  return false;
-}
 
 // ============================================================
 // MODERATION
@@ -282,16 +343,14 @@ async function handleModeration(message, userText) {
     return message.reply("✅ Report kamu udah dikirim ke admin sayang!"), true;
   }
   if (cmd === "kick") {
-    if (!userHasPerm(message, PermissionsBitField.Flags.KickMembers)) return message.reply("❌ Kamu ga punya permission buat kick sayang."), true;
-    if (!botHasPerm(message, PermissionsBitField.Flags.KickMembers)) return message.reply("❌ Aku ga punya permission buat kick."), true;
+    if (!userHasPerm(message, PermissionsBitField.Flags.KickMembers)) return message.reply("❌ Kamu ga punya permission sayang."), true;
     if (!mention) return message.reply("❌ Mention siapa yang mau di-kick."), true;
     const reason = args.slice(2).join(" ") || "Tidak ada alasan";
     await mention.kick(reason); await logMod("Kick", message.author, mention.user, reason);
     return message.reply(`✅ **${mention.user.tag}** udah di-kick.`), true;
   }
   if (cmd === "ban") {
-    if (!userHasPerm(message, PermissionsBitField.Flags.BanMembers)) return message.reply("❌ Kamu ga punya permission buat ban sayang."), true;
-    if (!botHasPerm(message, PermissionsBitField.Flags.BanMembers)) return message.reply("❌ Aku ga punya permission buat ban."), true;
+    if (!userHasPerm(message, PermissionsBitField.Flags.BanMembers)) return message.reply("❌ Kamu ga punya permission sayang."), true;
     if (!mention) return message.reply("❌ Mention siapa yang mau di-ban."), true;
     const reason = args.slice(2).join(" ") || "Tidak ada alasan";
     await mention.ban({ reason }); await logMod("Ban", message.author, mention.user, reason);
@@ -299,7 +358,7 @@ async function handleModeration(message, userText) {
   }
   if (cmd === "unban") {
     if (!userHasPerm(message, PermissionsBitField.Flags.BanMembers)) return message.reply("❌ Kamu ga punya permission sayang."), true;
-    const userId = args[1]; if (!userId) return message.reply("❌ Masukin user ID yang mau di-unban."), true;
+    const userId = args[1]; if (!userId) return message.reply("❌ Masukin user ID."), true;
     await message.guild.members.unban(userId); await logMod("Unban", message.author, userId, "-");
     return message.reply(`✅ User **${userId}** udah di-unban.`), true;
   }
@@ -307,35 +366,36 @@ async function handleModeration(message, userText) {
     if (!userHasPerm(message, PermissionsBitField.Flags.ModerateMembers)) return message.reply("❌ Kamu ga punya permission sayang."), true;
     if (!mention) return message.reply("❌ Mention siapa yang mau di-timeout."), true;
     const menit = parseInt(args[2]) || 10; const reason = args.slice(3).join(" ") || "Tidak ada alasan";
-    await mention.timeout(menit * 60 * 1000, reason); await logMod("Timeout", message.author, mention.user, `${menit} menit — ${reason}`);
+    await mention.timeout(menit * 60 * 1000, reason); await logMod("Timeout", message.author, mention.user, `${menit} menit`);
     return message.reply(`✅ **${mention.user.tag}** di-timeout ${menit} menit.`), true;
   }
   if (cmd === "untimeout") {
     if (!userHasPerm(message, PermissionsBitField.Flags.ModerateMembers)) return message.reply("❌ Kamu ga punya permission sayang."), true;
-    if (!mention) return message.reply("❌ Mention siapa yang mau di-untimeout."), true;
+    if (!mention) return message.reply("❌ Mention siapa."), true;
     await mention.timeout(null); await logMod("Untimeout", message.author, mention.user, "-");
-    return message.reply(`✅ Timeout **${mention.user.tag}** udah dicabut.`), true;
+    return message.reply(`✅ Timeout **${mention.user.tag}** dicabut.`), true;
   }
   if (cmd === "warn") {
     if (!userHasPerm(message, PermissionsBitField.Flags.ModerateMembers)) return message.reply("❌ Kamu ga punya permission sayang."), true;
-    if (!mention) return message.reply("❌ Mention siapa yang mau di-warn."), true;
+    if (!mention) return message.reply("❌ Mention siapa."), true;
     const reason = args.slice(2).join(" ") || "Tidak ada alasan";
     const totalWarns = addWarning(mention.id, message.guild.id, reason);
     await logMod(`Warn (${totalWarns}x)`, message.author, mention.user, reason);
-    if (totalWarns >= 5) { await mention.ban({ reason: "Auto-ban: 5 warnings" }); await logMod("Auto-Ban", client.user, mention.user, "5 warnings"); return message.reply(`⛔ **${mention.user.tag}** dapat warn ke-5, otomatis di-ban!`), true; }
-    if (totalWarns >= 3) { await mention.timeout(10 * 60 * 1000, "Auto-timeout: 3 warnings"); return message.reply(`⚠️ **${mention.user.tag}** dapat warn ke-${totalWarns}, di-timeout 10 menit!`), true; }
-    return message.reply(`⚠️ **${mention.user.tag}** dapat warning ke-${totalWarns}. Alasan: ${reason}`), true;
+    if (totalWarns >= 5) { await mention.ban({ reason: "Auto-ban: 5 warnings" }); return message.reply(`⛔ **${mention.user.tag}** auto-ban karena 5 warnings!`), true; }
+    if (totalWarns >= 3) { await mention.timeout(10 * 60 * 1000, "Auto-timeout: 3 warnings"); return message.reply(`⚠️ **${mention.user.tag}** warn ke-${totalWarns}, di-timeout 10 menit!`), true; }
+    return message.reply(`⚠️ **${mention.user.tag}** warning ke-${totalWarns}. Alasan: ${reason}`), true;
   }
   if (cmd === "warnings") {
-    if (!mention) return message.reply("❌ Mention siapa yang mau dicek warningnya."), true;
+    if (!mention) return message.reply("❌ Mention siapa."), true;
     const warns = getWarnings(mention.id, message.guild.id);
     if (warns.length === 0) return message.reply(`✅ **${mention.user.tag}** belum punya warning.`), true;
     return message.reply(`⚠️ **${mention.user.tag}** punya **${warns.length} warning:**\n${warns.map((w, i) => `${i+1}. ${w.reason}`).join("\n")}`), true;
   }
   if (cmd === "clearwarn") {
     if (!userHasPerm(message, PermissionsBitField.Flags.ModerateMembers)) return message.reply("❌ Kamu ga punya permission sayang."), true;
-    if (!mention) return message.reply("❌ Mention siapa yang mau dihapus warningnya."), true;
-    clearWarnings(mention.id, message.guild.id); return message.reply(`✅ Warning **${mention.user.tag}** udah dihapus.`), true;
+    if (!mention) return message.reply("❌ Mention siapa."), true;
+    clearWarnings(mention.id, message.guild.id);
+    return message.reply(`✅ Warning **${mention.user.tag}** dihapus.`), true;
   }
   if (cmd === "clear") {
     if (!userHasPerm(message, PermissionsBitField.Flags.ManageMessages)) return message.reply("❌ Kamu ga punya permission sayang."), true;
