@@ -104,7 +104,14 @@ async function playNext(guildId, message) {
   if (!current) return;
 
   try {
-    const ytdlp = spawn("yt-dlp", ["-f", "bestaudio", "--no-playlist", "-o", "-", `ytsearch1:${query}`]);
+    const ytdlp = spawn("yt-dlp", [
+  "-x",
+  "--audio-format", "opus",
+  "--audio-quality", "0",
+  "-o", "-",
+  "--no-playlist",
+  `ytsearch1:${query}`
+]);
     ytdlp.stderr.on("data", d => console.error("yt-dlp:", d.toString()));
     const resource = createAudioResource(ytdlp.stdout, { inputType: StreamType.Arbitrary });
     current.player.play(resource);
